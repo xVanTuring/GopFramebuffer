@@ -144,6 +144,30 @@ static inline int native_legacy_copy_pixels(volatile void *destination,
     return 1;
 }
 
+// A frame of another size than the scanout (a board that renders below the panel's size) onto the whole scanout, by nearest texel:
+// the CPU path, which serves the first frames before the GPU client takes them and any frame after a failed GPU copy. Steps are 16.16.
+static inline int native_legacy_copy_scaled(volatile void *destination,
+    uint64_t destinationBytes, uint64_t destinationStride, uint32_t destinationWidth, uint32_t destinationHeight,
+    const void *source, uint64_t sourceBytes, uint64_t sourceStride, uint32_t width, uint32_t height) {
+    uintptr_t dst=(uintptr_t)destination, src=(uintptr_t)source;
+    if (!dst || !src || (dst&3) || (destinationStride&3) || !destinationWidth || !destinationHeight ||
+        !native_legacy_surface_bounds(destinationWidth,destinationHeight,destinationStride,destinationBytes,destinationBytes) ||
+        !native_legacy_surface_bounds(width,height,sourceStride,sourceBytes,sourceBytes) ||
+        destinationBytes>UINTPTR_MAX || sourceBytes>UINTPTR_MAX ||
+        dst>UINTPTR_MAX-destinationBytes || src>UINTPTR_MAX-sourceBytes) return 0;
+    const uint64_t xStep=((uint64_t)width<<16)/destinationWidth, yStep=((uint64_t)height<<16)/destinationHeight;
+    for (uint32_t row=0;row<destinationHeight;++row) {
+        volatile uint32_t *out=(volatile uint32_t *)(dst+row*destinationStride);
+        const unsigned char *in=(const unsigned char *)(src+((row*yStep)>>16)*sourceStride);
+        for (uint32_t column=0;column<destinationWidth;++column) {
+            uint32_t value;
+            __builtin_memcpy(&value,in+((column*xStep)>>16)*4,4);
+            out[column]=value;
+        }
+    }
+    return 1;
+}
+
 // Differential copy for the slow scanout memory: only 64-byte blocks that differ from the previous frame (kept in an ordinary
 // cached shadow buffer, rows packed at width*4) are stored to the device mapping. The shadow must start from a full copy
 // (valid=0 copies everything). Returns the number of bytes stored, or UINT64_MAX when the geometry needs the plain copy.

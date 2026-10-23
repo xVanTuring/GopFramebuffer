@@ -54,9 +54,16 @@ extern "C" uint64_t mach_continuous_time(void);
 static inline bool nativeBgra(uint32_t format,uint32_t planes) {
     return (format==0x42475241 && !planes) || (format==0x26424741 && planes<=1);
 }
+// The render server's frame size against the panel's. The display reports that size; the GPU hand-off scales each frame up onto the panel
+// (NativeMetal's GpuScanoutPresenter.h) and the CPU path by nearest texel. Keep the panel's aspect: the touch input is normalized. At 3/4
+// (900x1500 on TB128FU's 1200x2000, tb128fu-084 to 086) the render server's CPU time per frame fell 26.7 -> 22.5 ms, but the GPU's scale
+// took about 30 ms a frame and the swap interval median rose 25 -> 33-36 ms: rendered at the panel's size again (1/1).
+static constexpr uint32_t kRenderNumerator=1,kRenderDenominator=1;
+static inline uint32_t native_legacy_render_size(uint32_t panel) {return (uint32_t)((uint64_t)panel*kRenderNumerator/kRenderDenominator)&~1u;}
 class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     OSDeclareDefaultStructors(NativeLegacyDisplay)
     IOMemoryMap *bootMapping=nullptr;
+    uint32_t panelWidth=0,panelHeight=0;   // the scanout's size; getDisplayDimensions answers the render size
     uint32_t scanBudget=32;
     void *shadow=nullptr;uint64_t shadowBytes=0;bool shadowValid=false;
     bool primary=false;
@@ -255,9 +262,9 @@ public:
         OSObject *surface=nullptr;
         memcpy(&surface,reinterpret_cast<const unsigned char *>(request)+2624,sizeof(surface));
         if(!surface) {
-            // Validated blank swap (all layers disabled over black): solid-fill the actual GOP.
+            // Validated blank swap (all layers disabled over black): solid-fill the actual GOP, the whole panel.
             PE_Video blank={};
-            uint32_t bw=0,bh=0;getDisplayDimensions(&bw,&bh);
+            const uint32_t bw=panelWidth,bh=panelHeight;
             uint64_t blankLength=(uint64_t)bw*bh*4;
             if(PE_current_console(&blank) || blank.v_baseAddr!=bootMapping->getPhysicalAddress() ||
                blank.v_width!=bw || blank.v_height!=bh || blank.v_depth!=32 || blank.v_rotate ||
@@ -285,12 +292,14 @@ public:
         uint64_t length=(uint64_t)width*height*4;
         uint64_t sourceStride=native_legacy_surface_stride(surface);
         uint64_t allocation=native_legacy_surface_allocation(surface);
+        // The frame is the render size (width x height), the scanout the panel's.
+        const bool scaled=width!=panelWidth || height!=panelHeight;
         if(!memory || !memory->metaCast("IOMemoryDescriptor") || !native_legacy_surface_bounds(width,height,sourceStride,allocation,memory->getLength()) ||
            native_legacy_surface_width(surface)<width || native_legacy_surface_height(surface)<height ||
            !nativeBgra(native_legacy_surface_format(surface),native_legacy_surface_planes(surface)) ||
            PE_current_console(&video) || video.v_baseAddr!=bootMapping->getPhysicalAddress() ||
-           video.v_width!=width || video.v_height!=height || video.v_depth!=32 || video.v_rotate ||
-           !native_legacy_surface_bounds(width,height,video.v_rowBytes,bootMapping->getLength(),bootMapping->getLength())) {
+           video.v_width!=panelWidth || video.v_height!=panelHeight || video.v_depth!=32 || video.v_rotate ||
+           !native_legacy_surface_bounds(panelWidth,panelHeight,video.v_rowBytes,bootMapping->getLength(),bootMapping->getLength())) {
             native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;
         }
         // The diagnostic renderer repaints the page over the scanout until it is told the system owns the display; the GPU path needs that as much
@@ -316,7 +325,7 @@ public:
         if(!source || !source->getVirtualAddress() || source->getLength()<allocation) {
             OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnNoMemory,request,0);return;
         }
-        if(!native_legacy_copy_layout(reinterpret_cast<volatile void *>(bootMapping->getVirtualAddress()),
+        if(!scaled && !native_legacy_copy_layout(reinterpret_cast<volatile void *>(bootMapping->getVirtualAddress()),
             bootMapping->getLength(),video.v_rowBytes,reinterpret_cast<const void *>(source->getVirtualAddress()),
             source->getLength(),sourceStride,width,height)) {
             OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnBadArgument,request,0);return;
@@ -336,7 +345,16 @@ public:
         }
         uint64_t copyStart;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(copyStart));
         uint64_t stored=UINT64_MAX;
-        {
+        if(scaled) {
+            // A render size below the panel's: nearest texel onto the whole panel (the GPU client's kernel mixes four).
+            shadowValid=false;
+            if(!native_legacy_copy_scaled(reinterpret_cast<volatile void *>(bootMapping->getVirtualAddress()),
+                bootMapping->getLength(),video.v_rowBytes,panelWidth,panelHeight,reinterpret_cast<const void *>(source->getVirtualAddress()),
+                source->getLength(),sourceStride,width,height)) {
+                OSSafeReleaseNULL(source);native_legacy_transfer_observed(kIOReturnBadArgument,request,0);return;
+            }
+            stored=(uint64_t)panelWidth*panelHeight*4;
+        } else {
             // Store only what changed since the previous frame (the scanout memory is slow device memory).
             uint64_t need=(uint64_t)width*height*4;
             // Differential copy is opt-in (sheng-fb-diff=1): on hardware it reads the whole source every frame and was not faster
@@ -504,12 +522,15 @@ public:
         bool valid=mapping->getVirtualAddress() && mapping->getPhysicalAddress()==video.v_baseAddr &&
                    mapping->getLength()==video.v_rowBytes*video.v_height;
         if(valid) {
-            installBootDimensions((uint32_t)video.v_width,(uint32_t)video.v_height);
+            const uint32_t renderWidth=native_legacy_render_size((uint32_t)video.v_width),renderHeight=native_legacy_render_size((uint32_t)video.v_height);
+            installBootDimensions(renderWidth,renderHeight);
             uint32_t width=0,height=0;getDisplayDimensions(&width,&height);
-            valid=width==video.v_width && height==video.v_height;
+            valid=renderWidth && renderHeight && width==renderWidth && height==renderHeight;
             if(valid) {
                 OSSafeReleaseNULL(bootMapping);bootMapping=mapping;mapping=nullptr;primary=video.v_display==1;
-                valid=native_legacy_gop_mapping_observed(this,bootMapping,width,height);
+                panelWidth=(uint32_t)video.v_width;panelHeight=(uint32_t)video.v_height;
+                // The boot page, its panic anchor and the UI scale are the panel's.
+                valid=native_legacy_gop_mapping_observed(this,bootMapping,panelWidth,panelHeight);
             }
         }
         OSSafeReleaseNULL(mapping);return valid;
