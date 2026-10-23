@@ -39,6 +39,14 @@ class NativeGOPPresenter : public IOService {
     struct {bool offered,delivered;uint64_t sequence;void *display;IOMemoryDescriptor *memory;IOMemoryMap *map;
             uint64_t stride;uint32_t width,height;} swap={};
     uint64_t swapSequence=0;
+    // The client task's mappings of the frames it was handed, kept across swaps: the compositor cycles through a few surfaces, so the
+    // client imports each one into the GPU once instead of every frame (on the TB128FU each frame pinned and mapped about 2400 pages and
+    // unmapped them again). NGPSwap.reserved names the entry: 0x80 | slot | generation << 8; a new generation means a new mapping.
+    struct Cached {IOMemoryDescriptor *memory;IOMemoryMap *map;task_t task;uint32_t generation;uint64_t used;};
+    Cached cached[4]={};
+    uint32_t cacheGeneration=0;
+    uint64_t cacheUse=0;
+    void flushCache();
     IOReturn waitSwap(task_t,uint64_t timeoutMs,NGPSwap *);
     IOReturn completeSwap(uint64_t sequence,int status);
     void abandonSwap();
@@ -103,6 +111,7 @@ void NativeGOPPresenter::stop(IOService *provider) {
     IOService::stop(provider);
 }
 void NativeGOPPresenter::free() {
+    flushCache();
     OSSafeReleaseNULL(mapping);if(gate){IOLockFree(gate);gate=nullptr;}IOService::free();
 }
 IOReturn NativeGOPPresenter::transfer(task_t task,const NGPPresent &q,NGPTransfer *result) {
@@ -163,9 +172,26 @@ IOReturn NativeGOPPresenter::waitSwap(task_t task,uint64_t timeoutMs,NGPSwap *ou
     swap.delivered=true;
     IOMemoryDescriptor *memory=swap.memory;memory->retain();
     const uint64_t sequence=swap.sequence,stride=swap.stride;const uint32_t width=swap.width,height=swap.height;
+    IOMemoryMap *map=nullptr;uint32_t tag=0;
+    for(unsigned i=0;i<4;++i)if(cached[i].map && cached[i].memory==memory && cached[i].task==task) {
+        map=cached[i].map;map->retain();cached[i].used=++cacheUse;tag=0x80|i|(cached[i].generation<<8);break;
+    }
     IOLockUnlock(gate);
     // The frame's pages go into the client's task here, writable like any import (the GPU maps them for reading; the kernel pins and maintains them).
-    IOMemoryMap *map=memory->createMappingInTask(task,0,kIOMapAnywhere);
+    if(!map) {
+        map=memory->createMappingInTask(task,0,kIOMapAnywhere);
+        if(map) {
+            IOLockLock(gate);
+            unsigned slot=0;
+            for(unsigned i=0;i<4;++i) {if(!cached[i].map){slot=i;break;} if(cached[i].used<cached[slot].used)slot=i;}
+            const Cached old=cached[slot];
+            memory->retain();map->retain();
+            cached[slot]={memory,map,task,++cacheGeneration,++cacheUse};
+            tag=0x80|slot|(cached[slot].generation<<8);
+            IOLockUnlock(gate);
+            if(old.map) {old.map->release();old.memory->release();}
+        }
+    }
     memory->release();
     IOLockLock(gate);
     if(!map || !map->getVirtualAddress() || !swap.offered || swap.sequence!=sequence) {
@@ -173,7 +199,7 @@ IOReturn NativeGOPPresenter::waitSwap(task_t task,uint64_t timeoutMs,NGPSwap *ou
     }
     swap.map=map;
     out->sequence=sequence;out->address=map->getVirtualAddress();out->bytes=map->getLength();out->stride=stride;
-    out->width=width;out->height=height;out->format=NGP_BGRX8888;out->reserved=0;
+    out->width=width;out->height=height;out->format=NGP_BGRX8888;out->reserved=tag;
     IOLockUnlock(gate);return kIOReturnSuccess;
 }
 IOReturn NativeGOPPresenter::completeSwap(uint64_t sequence,int status) {
@@ -193,10 +219,19 @@ void NativeGOPPresenter::abandonSwap() {
     gpuClient=false;
     auto done=swap;swap={};
     IOLockUnlock(gate);
+    flushCache();   // the client's task is gone with it
     if(!done.offered)return;
     OSSafeReleaseNULL(done.map);if(done.memory)done.memory->release();
     __atomic_fetch_add(&native_gop_gpu_abandoned,1,__ATOMIC_RELAXED);
     native_legacy_gpu_complete(done.display,kIOReturnAborted);
+}
+void NativeGOPPresenter::flushCache() {
+    if(!gate)return;
+    Cached old[4];
+    IOLockLock(gate);
+    memcpy(old,cached,sizeof old);bzero(cached,sizeof cached);
+    IOLockUnlock(gate);
+    for(auto &entry:old)if(entry.map) {entry.map->release();entry.memory->release();}
 }
 extern "C" void native_gop_presenter_set_source(IOService *presenter,IOService *nub) {
     if(NativeGOPPresenter *p=OSDynamicCast(NativeGOPPresenter,presenter))p->setMemorySource(nub);
