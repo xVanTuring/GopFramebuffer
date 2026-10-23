@@ -198,9 +198,11 @@ public:
         unsigned enabled=0;PE_parse_boot_argn("offline-legacy-register",&enabled,sizeof(enabled));
         if(enabled!=1)native_legacy_backend_guard(84,this,__builtin_return_address(0));
         // Nothing in the family publishes IOMFBDisplayRefresh (its platform subclass does), and without it the render server keeps its own
-        // 1/60 s heartbeat (int-210: refresh=0). Publish it before any client can find the display, only when sheng-vsync asks for more.
+        // 1/60 s heartbeat (int-210: refresh=0). Publish it before any client can find the display, only when sheng-vsync asks for more,
+        // or for a fixed rate (sheng-vsync-fixed=1, 60 Hz included).
         unsigned hz=0;PE_parse_boot_argn("sheng-vsync",&hz,sizeof(hz));
-        if(primary && hz>60 && hz<=240)native_legacy_set_refresh_properties(this);
+        unsigned locked=0;PE_parse_boot_argn("sheng-vsync-fixed",&locked,sizeof(locked));
+        if(primary && (hz>60 || (hz && locked==1)) && hz<=240)native_legacy_set_refresh_properties(this);
         IOService::registerService(options);native_legacy_registration_observed(this);
     }
     bool isMainDisplay() override {return primary;}
@@ -208,12 +210,14 @@ public:
     // registered, frames came every 16.7 ms), and the generic slot 301 fixes it at 1/60 s. With sheng-vsync=<Hz> it reports the panel's
     // own rate instead; the maximum interval and the step keep the original values. Words in 32.32 seconds, then their mach times.
     // The original maximum interval is 1/24 s (int-240), which offers the render server a 24 to sheng-vsync Hz range. The panel has no
-    // variable refresh, so sheng-vsync-fixed=1 reports the maximum interval equal to the minimum: one fixed rate.
+    // variable refresh, so sheng-vsync-fixed=1 reports the maximum interval equal to the minimum: one fixed rate. That holds at 60 Hz
+    // too: with the generic 24 to 60 Hz range a render server whose frames miss 1/60 s settles at 24 Hz (TB128FU: swaps every 41.7 ms
+    // while each frame was done in 11 to 19 ms).
     bool getRefreshAttributes(uint64_t *words,bool fixed) override {
         if(!IOMobileFramebufferLegacy::getRefreshAttributes(words,fixed) || !words)return false;
         unsigned hz=0;PE_parse_boot_argn("sheng-vsync",&hz,sizeof(hz));
-        if(hz<=60 || hz>240)return true;
         unsigned locked=0;PE_parse_boot_argn("sheng-vsync-fixed",&locked,sizeof(locked));
+        if(!hz || hz>240 || (hz<=60 && locked!=1))return true;
         const uint64_t interval=(1ull<<32)/hz;
         uint64_t machTime=0;nanoseconds_to_absolutetime(interval*1000000000ull>>32,&machTime);
         words[0]=interval;words[1]=machTime;
