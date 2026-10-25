@@ -60,6 +60,13 @@ static inline bool nativeBgra(uint32_t format,uint32_t planes) {
 // took about 30 ms a frame and the swap interval median rose 25 -> 33-36 ms: rendered at the panel's size again (1/1).
 static constexpr uint32_t kRenderNumerator=1,kRenderDenominator=1;
 static inline uint32_t native_legacy_render_size(uint32_t panel) {return (uint32_t)((uint64_t)panel*kRenderNumerator/kRenderDenominator)&~1u;}
+// The tick's health: the display whose tick runs, when it last fired, its interval in mach time and how many times the watchdog below
+// had to arm it again. Written under the work-loop gate; the kernel log reads them unlocked (LegacyDisplayProbe.cpp), as does the
+// watchdog's first look.
+class NativeLegacyDisplay;
+static NativeLegacyDisplay *gVsyncDisplay=nullptr;
+static volatile uint64_t gVsyncLastTick=0,gVsyncTickInterval=0;
+static volatile unsigned gVsyncTickRearms=0;
 class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     OSDeclareDefaultStructors(NativeLegacyDisplay)
     IOMemoryMap *bootMapping=nullptr;
@@ -99,7 +106,8 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         const void *head=nullptr;memcpy(&head,reinterpret_cast<const unsigned char *>(this)+5592,sizeof(head));return head;
     }
     // Selector 72's registration of a vsync client ends in kickSwapQueue (slot 290), which arms the tick; the tick stops by itself once
-    // the last client is removed.
+    // the last client is removed. Nothing else arms it, which is why a tick that stops while a client waits stays stopped: the watchdog
+    // below (native_legacy_vsync_kick, from the kernel log's writer) is the only path back.
     void armVsync() {
         if(!vsyncTimer || vsyncArmed || !vsyncWanted())return;
         vsyncArmed=true;vsyncNext=mach_absolute_time()+vsyncInterval;
@@ -112,6 +120,7 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         if(!vsyncWanted()){native_legacy_vsync_observed(2,vsyncHz);return;}
         const uint64_t now=mach_absolute_time();
         native_legacy_vsync_notify(this,now,mach_continuous_time(),vsyncInterval);
+        gVsyncLastTick=now;
         native_legacy_vsync_observed(1,vsyncHz);
         vsyncNext+=vsyncInterval;
         if(vsyncNext<=now){vsyncNext=now+vsyncInterval;native_legacy_vsync_observed(3,vsyncHz);}
@@ -127,18 +136,34 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         if(loop->addEventSource(timer)!=kIOReturnSuccess){timer->release();return;}
         nanoseconds_to_absolutetime(1000000000ull/hz,&vsyncInterval);
         vsyncHz=hz;vsyncTimer=timer;native_legacy_vsync_observed(4,hz);
-        // A client may already have registered: arm under the gate, like the registration does.
-        loop->runAction([](OSObject *owner,void *,void *,void *,void *)->IOReturn {
-            static_cast<NativeLegacyDisplay *>(owner)->armVsync();return kIOReturnSuccess;
-        },this);
+        gVsyncTickInterval=vsyncInterval;gVsyncLastTick=mach_absolute_time();gVsyncDisplay=this;
+        // A client may already have registered: arm it now (armVsync reads the family's queue head and the timer's state).
+        armVsync();
     }
     void stopVsync() {
+        if(gVsyncDisplay==this)gVsyncDisplay=nullptr;
         if(!vsyncTimer)return;
         vsyncTimer->cancelTimeout();
         if(IOWorkLoop *loop=getWorkLoop())loop->removeEventSource(vsyncTimer);
         OSSafeReleaseNULL(vsyncTimer);vsyncArmed=false;
     }
+    // Called from the kernel log's writer (BootRamoops.c) with the work-loop gate held by native_legacy_vsync_kick: a tick that has
+    // not fired for eight intervals is armed again, whatever vsyncArmed says. Nothing here runs while ticks arrive.
+    bool restartVsync() {
+        if(!vsyncTimer || !vsyncWanted())return false;
+        const uint64_t now=mach_absolute_time();
+        if(vsyncArmed && now-gVsyncLastTick<=8*vsyncInterval)return false;
+        vsyncArmed=true;vsyncNext=now+vsyncInterval;
+        vsyncTimer->wakeAtTime(vsyncNext);
+        gVsyncTickRearms=gVsyncTickRearms+1;
+        return true;
+    }
 public:
+    // Read by the kernel log (LegacyDisplayProbe.cpp) and by the watchdog below.
+    bool vsyncWaiting() const {return vsyncWanted();}
+    static IOReturn restartVsyncAction(OSObject *owner,void *,void *,void *,void *) {
+        static_cast<NativeLegacyDisplay *>(owner)->restartVsync();return kIOReturnSuccess;
+    }
     // Called by the GPU client's completion (any thread): the swap is finished on the framebuffer's work loop.
     void gpuComplete(int status) {
         struct Args {NativeLegacyDisplay *display;int status;} args={this,status};
@@ -548,3 +573,29 @@ public:
 OSDefineMetaClassAndStructors(NativeLegacyDisplay,IOMobileFramebufferLegacy)
 IOService *native_legacy_display_allocate(void) {return new NativeLegacyDisplay;}
 extern "C" void native_legacy_gpu_complete(void *display,int status) {if(display)static_cast<NativeLegacyDisplay *>(display)->gpuComplete(status);}
+// The tick as the kernel log reads it: whether a client waits for it (the family's queue at +5592), when it last fired, its interval
+// and how often the watchdog had to arm it. 0 with no timer: nothing to report.
+extern "C" unsigned native_legacy_vsync_state(uint64_t *last,uint64_t *interval,unsigned *rearms) {
+    if(last)*last=gVsyncLastTick;
+    if(interval)*interval=gVsyncTickInterval;
+    if(rearms)*rearms=gVsyncTickRearms;
+    NativeLegacyDisplay *display=gVsyncDisplay;
+    return display && display->vsyncWaiting()?1u:0u;
+}
+// The GOP scanout has no vblank, so this timer is the only clock the display gives the render server, and nothing else restarts it:
+// the family arms it from kickSwapQueue, and a render server that waits for a tick submits no swap, so no kick follows. A round of
+// 2026-10-25 drew two frames and then stayed idle for good while the GPU client kept polling a 500 ms wait, which is that shape.
+// BootRamoops.c's writer therefore asks here every 100 ms; a tick silent for eight intervals is armed again on the work loop and the
+// count shows in the log. While ticks arrive this reads two words and returns.
+extern "C" int native_legacy_vsync_kick(void) {
+    NativeLegacyDisplay *display=gVsyncDisplay;
+    if(!display || !display->vsyncWaiting())return 0;
+    const uint64_t interval=gVsyncTickInterval;
+    if(!interval)return 0;
+    const uint64_t now=mach_absolute_time();
+    if(gVsyncLastTick && now-gVsyncLastTick<=8*interval)return 0;
+    IOWorkLoop *loop=display->getWorkLoop();
+    if(!loop)return 0;
+    loop->runAction(&NativeLegacyDisplay::restartVsyncAction,display);
+    return 1;
+}
