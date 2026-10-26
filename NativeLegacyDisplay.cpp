@@ -7,6 +7,7 @@
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOWorkLoop.h>
 #include <IOKit/IOTimerEventSource.h>
+#include <IOKit/IODeviceMemory.h>
 #include <kern/clock.h>
 #include <IOKit/pwr_mgt/IOPM.h>
 #include <IOKit/pwr_mgt/IOPMpowerState.h>
@@ -36,6 +37,33 @@ extern "C" void native_legacy_retirement_observed(IOService *);
 // GPU hand-off (boot-arg sheng-fb-gpu=1): the frame is offered to the privileged GPU client instead of being copied; the swap retires when the
 // client reports the GPU copy done (native_legacy_gpu_complete). A refused offer or a failed copy uses the CPU copy below and is counted.
 extern "C" bool native_legacy_gpu_offer(void *display,IOMemoryDescriptor *,uint64_t stride,uint32_t width,uint32_t height);
+// The compositor's swapped surfaces, for a display that fetches them itself: [0] distinct surfaces seen, [1] swaps checked; for the first four, at
+// [2 + 3 * k]: allocation bytes, physical segments, largest segment (KiB). The pages are wired for the count and released.
+extern "C" {volatile uint32_t native_legacy_surfaces[14];}
+// Direct scanout (sheng-dpu-scanout=2): the display's two pipes fetch the compositor's surface through the display bank's window
+// (NativeUfs native_ufs_dpu_map). [0] flips, [1] surfaces mapped, [2] map failures, [3] latches that took over 50 ms, [4] longest latch (us),
+// [5] latch total (us, for the mean), [6] surfaces let go, [7] swaps that fell back to the copy, [8] flips back to the boot memory.
+extern "C" {volatile uint32_t native_legacy_direct[9];}
+extern "C" uint32_t native_ufs_dpu_map(unsigned slot,const uint64_t *pages,unsigned count) __attribute__((weak_import));
+extern "C" volatile uint32_t native_ufs_dpu_state __attribute__((weak_import));
+static void noteSurface(OSObject *surface,IOMemoryDescriptor *memory)
+{
+    static OSObject *seen[4];
+    native_legacy_surfaces[1]=native_legacy_surfaces[1]+1;
+    for(OSObject *known:seen)if(known==surface)return;
+    const unsigned k=native_legacy_surfaces[0];
+    native_legacy_surfaces[0]=k+1;
+    if(k>=4)return;
+    seen[k]=surface;
+    if(memory->prepare()!=kIOReturnSuccess)return;
+    uint32_t segments=0;uint64_t largest=0;
+    for(IOByteCount offset=0,length=0;offset<memory->getLength() && segments<100000;offset+=length,++segments) {
+        if(!memory->getPhysicalSegment(offset,&length,kIOMemoryMapperNone) || !length)break;
+        if(length>largest)largest=length;
+    }
+    memory->complete();
+    native_legacy_surfaces[2+3*k]=uint32_t(memory->getLength());native_legacy_surfaces[3+3*k]=segments;native_legacy_surfaces[4+3*k]=uint32_t(largest>>10);
+}
 extern "C" void native_legacy_gpu_fallback_observed(int status);
 // Swaps retired when the GPU client took the frame (before its copy finished), and copies that then failed after such a retirement.
 extern "C" {volatile uint64_t native_legacy_early_retires,native_legacy_early_failures;}
@@ -102,6 +130,94 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     uint64_t vsyncInterval=0,vsyncNext=0;
     unsigned vsyncHz=0;
     bool vsyncArmed=false;
+    // Direct scanout state, used on the work loop only. DPU 9.2 inside the MDP block (0xae01000): VIG 0 and 1 at 0x4000 and 0x6000 (source
+    // address 0 at +0x14, stride 0 at +0x24; VIG 1 takes the right half through its own source x), CTL 0 at 0x15000 (flush at +0x18, VIG 0
+    // and 1 are bits 0 and 1). i562: a flush of the two pipes latched within 5.4 ms with no start (the panel refreshes by itself).
+    struct DirectSlot {OSObject *surface;IOMemoryDescriptor *memory;uint32_t iova;uint64_t used;};
+    static constexpr unsigned kDirectSlots=4;
+    DirectSlot directSlots[kDirectSlots]={};
+    IOMemoryMap *mdpMap=nullptr;
+    volatile uint32_t *mdp=nullptr;
+    uint64_t *directPages=nullptr;
+    IOTimerEventSource *latchTimer=nullptr;
+    const OriginalLegacySwapRequest *latchRequest=nullptr;
+    uint64_t latchStart=0,directClock=0;
+    int shownSlot=-1,pendingSlot=-1;
+    bool directOn=false,directBoot=true;
+    static constexpr uint32_t kVig[2]={0x4000,0x6000},kCtlFlush=0x15018,kBootIova=0xb8000000U,kBootStride=0x2fa0;
+    void startDirect() {
+        unsigned mode=0;PE_parse_boot_argn("sheng-dpu-scanout",&mode,sizeof(mode));
+        if(mode<2 || !&native_ufs_dpu_map || !&native_ufs_dpu_state || !(native_ufs_dpu_state>>31) || !primary)return;
+        IODeviceMemory *memory=IODeviceMemory::withRange(0xae01000,0x8f000);
+        mdpMap=memory?memory->map(kIOMapAnywhere|kIOMapInhibitCache):nullptr;
+        if(memory)memory->release();
+        directPages=static_cast<uint64_t *>(IOMallocData(8192*sizeof(uint64_t)));
+        IOWorkLoop *loop=getWorkLoop();
+        latchTimer=loop?IOTimerEventSource::timerEventSource(this,&NativeLegacyDisplay::latchFired):nullptr;
+        if(!mdpMap || !directPages || !latchTimer || loop->addEventSource(latchTimer)!=kIOReturnSuccess) {
+            OSSafeReleaseNULL(mdpMap);OSSafeReleaseNULL(latchTimer);
+            if(directPages){IOFreeData(directPages,8192*sizeof(uint64_t));directPages=nullptr;}
+            return;
+        }
+        mdp=reinterpret_cast<volatile uint32_t *>(mdpMap->getVirtualAddress());
+        directOn=true;
+    }
+    void flip(uint32_t iova,uint32_t stride) {
+        for(uint32_t vig:kVig){mdp[(vig+0x14)/4]=iova;mdp[(vig+0x24)/4]=stride&0xffff;}
+        __asm__ volatile("dsb sy" ::: "memory");
+        mdp[kCtlFlush/4]=0x3;
+        __asm__ volatile("dsb sy" ::: "memory");
+    }
+    // The slot that holds this surface, mapping it into a free one (never the one on screen or the one waiting to latch) the first time.
+    int directSlot(OSObject *surface,IOMemoryDescriptor *memory) {
+        ++directClock;
+        int pick=-1;
+        for(unsigned k=0;k<kDirectSlots;++k)if(directSlots[k].surface==surface && directSlots[k].memory==memory){directSlots[k].used=directClock;return int(k);}
+        for(unsigned k=0;k<kDirectSlots;++k) {
+            if(int(k)==shownSlot || int(k)==pendingSlot)continue;
+            if(pick<0 || !directSlots[k].surface || (directSlots[pick].surface && directSlots[k].used<directSlots[pick].used))pick=int(k);
+        }
+        if(pick<0)return -1;
+        DirectSlot &slot=directSlots[pick];
+        if(slot.surface) {
+            slot.memory->complete();OSSafeReleaseNULL(slot.memory);OSSafeReleaseNULL(slot.surface);
+            native_legacy_direct[6]=native_legacy_direct[6]+1;
+        }
+        if(memory->getLength()>8192ull*4096 || memory->prepare()!=kIOReturnSuccess){native_legacy_direct[2]=native_legacy_direct[2]+1;return -1;}
+        unsigned count=0;bool ok=true;
+        for(IOByteCount offset=0;offset<memory->getLength() && ok;) {
+            IOByteCount length=0;
+            const addr64_t pa=memory->getPhysicalSegment(offset,&length,kIOMemoryMapperNone);
+            if(!pa || (pa&0xfff) || !length){ok=false;break;}
+            for(IOByteCount at=0;at<length && offset+at<memory->getLength();at+=4096)directPages[count++]=pa+at;
+            offset+=length;
+        }
+        const uint32_t iova=ok?native_ufs_dpu_map(unsigned(pick),directPages,count):0;
+        if(!iova){memory->complete();native_legacy_direct[2]=native_legacy_direct[2]+1;return -1;}
+        surface->retain();memory->retain();
+        slot={surface,memory,iova,directClock};
+        native_legacy_direct[1]=native_legacy_direct[1]+1;
+        return pick;
+    }
+    static void latchFired(OSObject *owner,IOTimerEventSource *) {static_cast<NativeLegacyDisplay *>(owner)->latchTick();}
+    void latchTick() {
+        if(!latchRequest)return;
+        uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time()-latchStart,&ns);
+        if((mdp[kCtlFlush/4]&0x3) && ns<50000000ull){latchTimer->setTimeoutUS(500);return;}
+        if(ns>=50000000ull)native_legacy_direct[3]=native_legacy_direct[3]+1;
+        const uint32_t us=uint32_t(ns/1000);
+        if(us>native_legacy_direct[4])native_legacy_direct[4]=us;
+        native_legacy_direct[5]=native_legacy_direct[5]+us;
+        shownSlot=pendingSlot;pendingSlot=-1;
+        const OriginalLegacySwapRequest *request=latchRequest;latchRequest=nullptr;
+        finishTransfer(request,true);
+    }
+    // Back to the boot loader's memory (the blank frame and the copy are drawn there).
+    void directToBoot() {
+        if(!directOn || directBoot)return;
+        flip(kBootIova,kBootStride);directBoot=true;shownSlot=-1;
+        native_legacy_direct[8]=native_legacy_direct[8]+1;
+    }
     bool vsyncWanted() const {
         const void *head=nullptr;memcpy(&head,reinterpret_cast<const unsigned char *>(this)+5592,sizeof(head));return head;
     }
@@ -177,6 +293,9 @@ public:
     void stop(IOService *provider) override {
         stopVsync();
         transferred=false;for(auto &entry: validated)entry=nullptr;gpuRequest=nullptr;gpuRetired=false;
+        directToBoot();latchRequest=nullptr;pendingSlot=-1;
+        if(latchTimer){latchTimer->cancelTimeout();if(IOWorkLoop *loop=getWorkLoop())loop->removeEventSource(latchTimer);OSSafeReleaseNULL(latchTimer);}
+        directOn=false;
         if(logicalPM){PMstop();logicalPM=false;}
         primary=false;IOMobileFramebufferLegacy::stop(provider);OSSafeReleaseNULL(bootMapping);
     }
@@ -192,7 +311,7 @@ public:
     }
     bool start(IOService *provider) override {
         if(!startDisplay(provider))return false;
-        startVsync();return true;
+        startVsync();startDirect();return true;
     }
     bool startDisplay(IOService *provider) {
         if(!IOMobileFramebufferLegacy::start(provider))return false;
@@ -297,6 +416,7 @@ public:
                 native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;
             }
             if(!native_legacy_prepare_scanout()) {native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;}
+            directToBoot();
             if(!native_legacy_fill_pixels(reinterpret_cast<volatile void *>(bootMapping->getVirtualAddress()),
                 bootMapping->getLength(),blank.v_rowBytes,bw,bh,0xff000000U)) {
                 native_legacy_transfer_observed(kIOReturnBadArgument,request,0);return;
@@ -332,6 +452,20 @@ public:
         if(!gpuBypass) {
             if(!native_legacy_prepare_scanout()) {native_legacy_transfer_observed(kIOReturnNotReady,request,0);return;}
         }
+        noteSurface(surface,memory);
+        if(directOn && !gpuBypass && !latchRequest) {
+            const int slot=directSlot(surface,memory);
+            if(slot>=0) {
+                native_legacy_swap_stage(1);
+                flip(directSlots[slot].iova,uint32_t(sourceStride));directBoot=false;
+                native_legacy_direct[0]=native_legacy_direct[0]+1;
+                shadowValid=false;pendingSlot=slot;latchRequest=request;transferred=true;
+                latchStart=mach_absolute_time();latchTimer->setTimeoutUS(500);
+                return;
+            }
+            native_legacy_direct[7]=native_legacy_direct[7]+1;
+        }
+        directToBoot();
         if(!gpuBypass && native_legacy_gpu_offer(this,memory,sourceStride,width,height)) {
             // The GPU writes the scanout memory behind the CPU's back: the differential copy's picture of it is stale from now on.
             native_legacy_swap_stage(1);
